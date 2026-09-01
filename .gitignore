@@ -16,6 +16,16 @@ venv/
 # Claude Code local tool state
 .claude/
 
+# Local-only: backtest engine + one-off analysis/scratch scripts - kept on
+# disk for personal use, deliberately excluded from the public repo
+backtest/
+alpaca_test.py
+historical.py
+run_backtest_example.py
+run_backtest_vol_spread.py
+analyze_losing_trades.py
+losing_trade_analysis.csv
+
 # OS
 .DS_Store
 Thumbs.db
