@@ -1,0 +1,21 @@
+# Secrets - never commit
+.env
+*.env
+!.env.example
+
+# Generated cache / runtime state
+data_cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Claude Code local tool state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
