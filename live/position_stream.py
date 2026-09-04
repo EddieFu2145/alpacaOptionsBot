@@ -14,13 +14,21 @@ what triggered it. The agent still decides what to do using its existing
 tools, including close_position - a breach here means "go look at this
 now", not a direct, unmediated close bypassing the agent entirely.
 
-Known limitation: subscribes to symbols from currently-open logged
-positions at startup only. If the agent opens a new position while this
-is already running, restart the watcher to pick it up - there's no
-dynamic re-subscription.
+Re-subscribes dynamically: a background thread re-reads open_trades()
+every RESUB_INTERVAL_SECONDS and subscribes to any new symbols. Confirmed
+via alpaca-py's own source that this is safe - DataStream._subscribe
+explicitly handles the "already running" case with
+asyncio.run_coroutine_threadsafe, which is exactly what's needed to push
+a live subscribe message onto the stream's event loop from a separate
+thread while stream.run() blocks the main one. Previously this only
+subscribed at startup, so a position opened after the watcher started got
+zero real-time monitoring until a restart - partially masked by
+run_trading_day.py's supervisor loop re-entering watch_positions() after
+every research session, but with a real gap in between.
 """
 import asyncio
 import os
+import threading
 import time
 from datetime import date
 from typing import Optional
@@ -29,6 +37,7 @@ from dotenv import load_dotenv
 
 from alpaca.data.live.option import OptionDataStream
 from data.options import parse_occ_symbol
+from live.activity_log import log_event
 from live.trade_log import open_trades
 
 load_dotenv()
@@ -36,9 +45,12 @@ load_dotenv()
 TAKE_PROFIT_THRESHOLD = 0.65
 PACE_RATIO_THRESHOLD = 3.0
 TRIGGER_COOLDOWN_SECONDS = 30 * 60  # re-arm 30 min after a review, in case the agent held rather than closed
+RESUB_INTERVAL_SECONDS = 60
+STREAM_STALE_SECONDS = 180  # no quote at all in 3 minutes during market hours means the connection is wedged, not that the market is quiet
 
 _last_mid: dict[str, float] = {}
 _last_triggered_at: dict[str, float] = {}  # short_symbol -> monotonic time of last escalation
+_last_quote_at: Optional[float] = None
 
 
 def _mid_price(quote) -> Optional[float]:
@@ -96,6 +108,14 @@ async def _check_and_maybe_trigger(agent_module) -> None:
             f"[TRIGGER] {reason} on {trade['underlying']} ({short_symbol}/{long_symbol}): "
             f"{pct_of_max_outcome:.1%} of max outcome after {days_held}/{planned_days} days held."
         )
+        log_event(
+            "trigger",
+            underlying=trade["underlying"],
+            reason=reason,
+            pct_of_max_outcome=pct_of_max_outcome,
+            days_held=days_held,
+            planned_days=planned_days,
+        )
         prompt = (
             f"A live monitor just flagged {reason} on your {trade['underlying']} position "
             f"(short {short_symbol}, long {long_symbol}, {contracts} contracts): "
@@ -112,6 +132,7 @@ async def _run_agent_safely(agent_module, prompt: str) -> None:
         print(f"[agent response] {result}")
     except Exception as exc:
         print(f"[agent error] {exc}")
+        log_event("error", text=str(exc), source="watcher")
 
 
 class _ThrottledOptionDataStream(OptionDataStream):
@@ -138,6 +159,58 @@ class _ThrottledOptionDataStream(OptionDataStream):
             raise
 
 
+def _watchdog_loop(stream: OptionDataStream, started_at: float) -> None:
+    """alpaca-py's own reconnect loop (_run_forever) has no escape hatch when
+    a connection gets stuck failing to (re)connect - confirmed live: a
+    "connection limit exceeded" / DNS-resolution failure loop ran for 4.5+
+    hours straight, with zero quotes ever getting through, silently leaving
+    every open position completely unmonitored the whole time. The only
+    known fix (confirmed by the same failure once before) is a full process
+    restart - a fresh stream connects immediately once the old one is gone.
+    Forcing stream.stop() after a stretch with no quotes at all breaks
+    watch_positions() out of its blocking stream.run() call and back to
+    run_trading_day.py's retry loop, which builds a brand new stream (and,
+    if positions closed in the meantime, a fresh research session first) -
+    a real chance to reconnect cleanly instead of staying wedged forever.
+    """
+    while True:
+        time.sleep(30)
+        last = _last_quote_at or started_at
+        if time.monotonic() - last > STREAM_STALE_SECONDS:
+            print(
+                f"[watchdog] no quotes received in over {STREAM_STALE_SECONDS}s - "
+                "the stream looks wedged, forcing a reconnect."
+            )
+            try:
+                stream.stop()
+            except Exception as exc:
+                print(f"[watchdog] stream.stop() failed: {exc!r}")
+            return
+
+
+def _resubscribe_loop(stream: OptionDataStream, on_quote, known_symbols: set[str]) -> None:
+    """Runs in a background thread for the life of the process. Best-effort:
+    a symbol added between a check and the next one just gets picked up
+    next cycle rather than needing any locking - not closing the gap
+    entirely, but shrinking it from "until the next restart" to at most
+    RESUB_INTERVAL_SECONDS.
+    """
+    while True:
+        time.sleep(RESUB_INTERVAL_SECONDS)
+        current: set[str] = set()
+        for trade in open_trades():
+            current.add(trade["short_symbol"])
+            current.add(trade["long_symbol"])
+        new_symbols = current - known_symbols
+        if new_symbols:
+            print(f"[re-subscribe] {len(new_symbols)} new symbol(s) found: {sorted(new_symbols)}")
+            try:
+                stream.subscribe_quotes(on_quote, *new_symbols)
+                known_symbols.update(new_symbols)
+            except Exception as exc:
+                print(f"[re-subscribe] failed, will retry next cycle: {exc!r}")
+
+
 def watch_positions(agent_module=None) -> None:
     """Blocking - runs the websocket's own event loop internally (alpaca-py's
     stream.run() calls asyncio.run itself). Ctrl+C to stop."""
@@ -157,7 +230,12 @@ def watch_positions(agent_module=None) -> None:
         print("No open positions to watch - nothing to subscribe to.")
         return
 
+    global _last_quote_at
+    _last_quote_at = None  # reset so a stale timestamp from a prior call can't trip the watchdog instantly
+
     async def on_quote(quote) -> None:
+        global _last_quote_at
+        _last_quote_at = time.monotonic()
         price = _mid_price(quote)
         if price is not None:
             _last_mid[quote.symbol] = price
@@ -165,6 +243,9 @@ def watch_positions(agent_module=None) -> None:
 
     stream.subscribe_quotes(on_quote, *symbols)
     print(f"Watching {len(symbols)} option legs across {len(open_trades())} logged position(s)...")
+
+    threading.Thread(target=_resubscribe_loop, args=(stream, on_quote, symbols), daemon=True).start()
+    threading.Thread(target=_watchdog_loop, args=(stream, time.monotonic()), daemon=True).start()
     stream.run()
 
 

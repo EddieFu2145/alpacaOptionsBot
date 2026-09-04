@@ -3,11 +3,11 @@ runs one agent session to research and possibly open a trade, then hands
 off to the websocket watcher for continuous exit monitoring for the rest
 of the session.
 
-Uses alpaca-py directly (not the MCP client) for the open-market wait loop
-- AlpacaMCPClient launches a fresh alpaca-mcp-server subprocess per
-instantiation, which is fine for one-shot tool calls but far too heavy to
-poll every minute for hours. The MCP-based agent is only invoked once the
-market is actually open.
+Uses alpaca-py directly (not MCP) for the open-market wait loop - each
+research session spins up its own fresh alpaca-mcp-server subprocess for
+the duration of that one session, which is fine for one-shot tool calls but
+far too heavy to poll every minute for hours. The MCP-based agent is only
+invoked once the market is actually open.
 """
 import asyncio
 import sys
@@ -27,6 +27,7 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import live.agent_deepseek as agent
 from data.clients import trading_client
 from data.screener import DEFAULT_LARGE_CAP_UNIVERSE
+from live.activity_log import log_event
 from live.position_stream import watch_positions
 from live.premarket_check import premarket_briefing
 from live.trade_log import open_trades
@@ -47,6 +48,7 @@ def _wait_for_market_open() -> None:
             continue
         if clock.is_open:
             print(f"[{now}] Market is open.")
+            log_event("market_open")
             return
         print(f"[{now}] Market closed. Next open: {clock.next_open.isoformat()}. Checking again in {POLL_SECONDS}s.")
         time.sleep(POLL_SECONDS)
@@ -82,8 +84,7 @@ def _run_research_session() -> None:
     print("Running agent session...")
     message = (
         f"Market is open. {briefing_text} Check existing positions, screen for candidates, "
-        "and decide whether to open a new trade this week. Reminder: this is the first live day "
-        "for this pipeline - size any new trade at 1 contract."
+        "and decide whether to open a new trade this week."
     )
     # Indefinite retry, not capped: a Gemini API outage (confirmed to happen -
     # sustained 503 "high demand" errors observed for 10+ minutes on this
@@ -113,6 +114,7 @@ def main() -> None:
             time.sleep(RECHECK_SECONDS)
 
     print(f"[{datetime.now(timezone.utc).isoformat()}] Market closed. Ending for the day.")
+    log_event("market_closed_for_day")
 
 
 def _run_with_retries(label: str, fn, max_attempts: int | None = 5, backoff_seconds: float = 30.0):
@@ -137,5 +139,32 @@ def _run_with_retries(label: str, fn, max_attempts: int | None = 5, backoff_seco
             time.sleep(backoff_seconds)
 
 
+def _run_forever_while_market_open() -> None:
+    """The outermost safety net. main() already loops internally until
+    market close, and its two heaviest calls (the agent session and
+    position-watching) are each wrapped in indefinite retry - but nothing
+    previously caught a crash in main() itself or in the code around
+    those two calls (the market-open wait, the pre-market briefing, the
+    while loop's own control flow). Confirmed live tonight that whole-
+    process crashes are real, not hypothetical (an encoding bug in the
+    error-logging path itself once took the entire process down before it
+    was fixed) - so this restarts main() from scratch on ANY exception,
+    and only stops once the market is confirmed closed, to avoid an
+    all-night restart loop for no reason.
+    """
+    while True:
+        try:
+            main()
+            return  # main() only returns normally once the market has closed
+        except Exception as exc:
+            now = datetime.now(timezone.utc).isoformat()
+            print(f"[{now}] [supervisor] main() crashed: {exc!r}")
+            if not _market_is_open():
+                print(f"[{now}] [supervisor] market is closed - not restarting.")
+                return
+            print(f"[{now}] [supervisor] market still open - restarting main() in {SESSION_RETRY_SECONDS}s.")
+            time.sleep(SESSION_RETRY_SECONDS)
+
+
 if __name__ == "__main__":
-    main()
+    _run_forever_while_market_open()

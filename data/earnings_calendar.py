@@ -30,7 +30,8 @@ _BASE_URL = "https://finnhub.io/api/v1/calendar/earnings"
 def _get(params: dict) -> list[dict]:
     if not _FINNHUB_KEY:
         return []
-    resp = requests.get(_BASE_URL, params={**params, "token": _FINNHUB_KEY}, timeout=10)
+    resp = requests.get(_BASE_URL, params={
+                        **params, "token": _FINNHUB_KEY}, timeout=10)
     resp.raise_for_status()
     return resp.json().get("earningsCalendar", [])
 
@@ -51,7 +52,8 @@ def earnings_in_range(start: date, end: date, symbol: Optional[str] = None) -> p
             params["symbol"] = symbol
         rows = _get(params)
         return pd.DataFrame(
-            [{"symbol": r["symbol"], "date": date.fromisoformat(r["date"]), "hour": r.get("hour", "")} for r in rows],
+            [{"symbol": r["symbol"], "date": date.fromisoformat(
+                r["date"]), "hour": r.get("hour", "")} for r in rows],
             columns=["symbol", "date", "hour"],
         )
 
@@ -92,7 +94,8 @@ def earnings_before_expiration(underlying: str, expiration: date) -> dict:
     if rows.empty:
         return {"has_earnings_risk": False, "earnings_dates": [], "checked": True}
 
-    dates = [{"date": d.isoformat(), "hour": h} for d, h in zip(rows["date"], rows["hour"])]
+    dates = [{"date": d.isoformat(), "hour": h}
+             for d, h in zip(rows["date"], rows["hour"])]
     return {"has_earnings_risk": True, "earnings_dates": dates, "checked": True}
 
 
@@ -100,7 +103,8 @@ def recent_earnings_dates(symbol: str, before: date, n: int = 4) -> list[tuple[d
     """A symbol's last `n` earnings dates strictly before `before`, each as
     (date, hour). Looks back 3 years, which should comfortably cover 4
     quarterly reports even accounting for schedule slippage."""
-    df = earnings_in_range(before - timedelta(days=3 * 365), before - timedelta(days=1), symbol=symbol)
+    df = earnings_in_range(before - timedelta(days=3 * 365),
+                           before - timedelta(days=1), symbol=symbol)
     if df.empty:
         return []
     df = df.sort_values("date", ascending=False).head(n).sort_values("date")

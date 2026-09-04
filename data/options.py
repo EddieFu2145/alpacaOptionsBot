@@ -5,6 +5,7 @@ from typing import Optional
 
 import pandas as pd
 
+from alpaca.common.exceptions import APIError
 from alpaca.data.requests import OptionBarsRequest, OptionChainRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.enums import AssetStatus
@@ -132,8 +133,19 @@ def get_expired_contracts(
 
 def has_liquid_weekly_options(symbol: str, expiration: date) -> bool:
     """Cheap live check: does this contract's chain actually show trading
-    activity, or is it a listed-but-dead expiration."""
-    chain = get_option_chain(symbol, expiration_date=expiration)
+    activity, or is it a listed-but-dead expiration.
+
+    Confirmed live: Alpaca's most-actives/movers screener can surface
+    non-equity instruments (e.g. ACHR.WS, a warrant) that have no options
+    at all - the chain endpoint doesn't return an empty result for these,
+    it rejects the request outright with a 400 ("invalid underlying
+    symbol"). A single such symbol used to crash candidate_universe()
+    entirely rather than just being correctly treated as "not eligible".
+    """
+    try:
+        chain = get_option_chain(symbol, expiration_date=expiration)
+    except APIError:
+        return False
     return not chain.empty and chain["last_trade_price"].notna().sum() >= 4
 
 

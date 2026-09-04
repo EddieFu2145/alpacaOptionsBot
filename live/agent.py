@@ -35,7 +35,7 @@ from data.earnings_calendar import earnings_before_expiration
 from data.options import parse_occ_symbol
 from data.screener import candidate_universe, rank_by_vol_signal
 from live.mcp_client import _default_server_path
-from live.order_helpers import confirm_fill, live_options_buying_power
+from live.order_helpers import close_both_legs, confirm_fill, live_options_buying_power, resolved_credit
 from live.position_management import evaluate_open_positions
 from live.premarket_check import premarket_briefing
 from live.trade_log import record_close, record_open
@@ -85,7 +85,7 @@ def check_premarket_moves(symbols: list[str]) -> list[dict]:
 
 
 @beta_tool
-def screen_candidates(min_market_cap: float = 10_000_000_000, top: int = 20) -> list[dict]:
+def screen_candidates(min_market_cap: float = 2_000_000_000, top: int = 20) -> list[dict]:
     """Find underlyings worth researching this week: pulls Alpaca's own
     most-active/movers lists, filters to a market-cap floor (Finnhub, if
     configured - otherwise restricted to a curated large-cap list, since
@@ -168,10 +168,19 @@ thin, one-sided markets.
 this option expires. This one IS effectively a hard gate - `propose_and_execute_credit_spread` \
 will reject the trade unless you explicitly say in the rationale that this is a deliberate \
 earnings play, since an earnings move can blow through what the other five signals assumed \
-about normal-day volatility.
-  None of the first five is individually a hard gate - weigh them together and use judgment - \
-but a spread that fails most of them is a weak candidate regardless of what the raw premium \
-looks like.
+about normal-day volatility. Earnings-driven IV isn't an edge this pipeline trades - it's a risk \
+to avoid, not a setup to seek out.
+  - `macro_risk`: a high-impact scheduled macro event (NFP, CPI, FOMC, PPI, etc.) landing on or \
+before expiration. This is a soft flag, not a hard gate - unlike earnings, it isn't blocked in \
+code - but weigh it seriously: a broad market-moving print on expiration day is correlated risk \
+across every position you hold, not just this one, and it settles same-day with no time to \
+react if it gaps against you. `checked: false` means the calendar source couldn't be reached \
+(it's a free feed and does rate-limit) - treat unknown the same as a real risk, not as "clear". \
+`has_macro_risk: true` with named events should push you toward a smaller size or passing \
+outright, not just noting it in the rationale.
+  None of these is individually a hard gate except earnings_risk - weigh them together and use \
+judgment - but a spread that fails most of them is a weak candidate regardless of what the raw \
+premium looks like.
 - Every other Alpaca tool available to you is read-only: account state, positions, option \
 chains, quotes, and news. Use them to research before proposing a trade.
 - A proposed trade will be rejected in code (not by you) if it isn't a real net credit, if its \
@@ -287,10 +296,10 @@ def make_propose_and_execute_tool(mcp_session: ClientSession):
         fill = await confirm_fill(mcp_session, order_id)
 
         if fill["status"] == "filled":
-            record_open(short_symbol, long_symbol, short_leg["underlying"], contracts, limit_credit, short_leg["expiration"])
+            record_open(short_symbol, long_symbol, short_leg["underlying"], contracts, resolved_credit(fill, limit_credit), short_leg["expiration"])
             return f"APPROVED AND FILLED (margin ${margin:,.0f}).{earnings_note} {fill}"
         if fill["status"] == "partially_filled":
-            record_open(short_symbol, long_symbol, short_leg["underlying"], contracts, limit_credit, short_leg["expiration"])
+            record_open(short_symbol, long_symbol, short_leg["underlying"], contracts, resolved_credit(fill, limit_credit), short_leg["expiration"])
             return (
                 f"PARTIALLY FILLED (margin ${margin:,.0f}).{earnings_note} logged, but confirm the actual filled size "
                 f"via get_order_by_id before assuming the full {contracts} contracts are on. {fill}"
@@ -328,11 +337,16 @@ def make_close_position_tool(mcp_session: ClientSession):
             rationale: One or two sentences on why you're closing this now
                 (e.g. most of the credit captured, thesis invalidated, the
                 underlying has moved against the short strike).
+        Closing either leg of a logged spread automatically closes its
+        paired leg too, so a spread never gets left half-open.
         """
-        result = await mcp_session.call_tool("close_position", {"symbol_or_asset_id": symbol})
-        texts = [block.text for block in result.content if hasattr(block, "text")]
-        record_close(symbol)
-        return f"Closed {symbol} ({rationale}). Order response: {texts}"
+        outcome = await close_both_legs(mcp_session, symbol)
+        for sym in outcome["closed_symbols"]:
+            record_close(sym, realized_pnl=outcome["realized_pnl_by_symbol"].get(sym))
+        summary = f"Closed {outcome['closed_symbols']} ({rationale}). Results: {outcome['results']}"
+        if outcome["errors"]:
+            summary += f" ERRORS on some legs (may already be closed): {outcome['errors']}"
+        return summary
 
     return close_position
 

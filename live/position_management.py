@@ -4,7 +4,7 @@ disproportionate to how long the position has actually been held (moving
 much faster than a normal decay pace implies something unusual happened,
 in either direction).
 
-Shared between live/agent.py and live/agent_gemini.py - both providers
+Shared between live/agent.py and live/agent_deepseek.py - both providers
 get identical exit math, not two copies that can drift apart.
 """
 from datetime import date
